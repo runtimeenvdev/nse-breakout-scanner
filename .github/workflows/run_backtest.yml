@@ -1,0 +1,49 @@
+name: Run 10-Year NSE Strategy Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: 'Number of NSE Stocks to Backtest (100 = ~3 mins, 500 = ~12 mins)'
+        required: true
+        default: '100'
+        type: choice
+        options:
+          - '100'
+          - '250'
+          - '500'
+
+jobs:
+  backtest-strategies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run 10-Year Backtest Comparison
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SAMPLE_SIZE: ${{ github.event.inputs.sample_size || '100' }}
+        run: python backtest_comparison.py
+
+      - name: Upload Trade Logs & Summary CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nse-10yr-backtest-results
+          path: |
+            backtest_summary.csv
+            backtest_all_trades.csv
+          retention-days: 30
