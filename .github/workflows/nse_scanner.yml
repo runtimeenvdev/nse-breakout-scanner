@@ -1,0 +1,54 @@
+name: NSE 200-WMA Breakout Scanner
+
+on:
+  schedule:
+    # Runs automatically at 3:05 PM IST every Friday (09:35 UTC) so the scan 
+    # finishes and lands on your Telegram by ~3:15 PM IST before market close.
+    - cron: '35 9 * * 5'
+
+  workflow_dispatch:
+    inputs:
+      universe_mode:
+        description: 'Stock Universe to Scan'
+        required: true
+        default: 'NIFTY500'
+        type: choice
+        options:
+          - NIFTY500
+          - ALL_NSE
+
+jobs:
+  run-breakout-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute NSE 200-WMA Breakout Scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          UNIVERSE_MODE: ${{ github.event.inputs.universe_mode || 'NIFTY500' }}
+        run: python nse_200wma_scanner.py
+
+      - name: Upload Breakout Watchlist CSV (If Generated)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nse-breakout-alerts-${{ github.run_number }}
+          path: breakout_alerts.csv
+          if-no-files-found: ignore
+          retention-days: 30
