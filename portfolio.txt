@@ -1,0 +1,4 @@
+# Format: SYMBOL,BUY_PRICE,INITIAL_SL
+# Example (Remove the # when you actually buy a stock):
+# TRENT,5200,4850
+# HAL,4150,3890
