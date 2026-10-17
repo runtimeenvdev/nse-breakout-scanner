@@ -1,16 +1,25 @@
 import os
+import sys
 import io
+import math
 import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime
 
+# =========================================================
+# 1. CREDENTIALS & ₹1,00,000 PORTFOLIO RISK SETTINGS
+# =========================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "NIFTY500")
 PORTFOLIO_FILE = "portfolio.txt"
+
+TOTAL_CAPITAL = float(os.getenv("TOTAL_CAPITAL", "100000"))       # ₹1,00,000 Portfolio
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.75")) # 1.75% Risk (₹1,750)
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "22.0"))     # Max 22% (₹22,000) per stock
 
 def get_nse_tickers(mode="NIFTY500"):
     """Fetches official NSE stock symbols directly from NSE India archives."""
@@ -38,8 +47,31 @@ def calculate_rsi(series, period=14):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+def calculate_position_size(entry_price, stop_loss):
+    """Calculates exact share quantity, Rupee outlay, and pyramid level for ₹1,00,000 capital."""
+    max_risk_rupees = TOTAL_CAPITAL * (RISK_PER_TRADE_PCT / 100.0)
+    max_alloc_rupees = TOTAL_CAPITAL * (MAX_POSITION_PCT / 100.0)
+    risk_per_share = max(entry_price - stop_loss, 0.05)
+
+    raw_shares = math.floor(max_risk_rupees / risk_per_share)
+    max_capped_shares = math.floor(max_alloc_rupees / entry_price)
+    final_shares = max(1, min(raw_shares, max_capped_shares))
+
+    invested_capital = round(final_shares * entry_price, 2)
+    actual_rupee_risk = round(final_shares * risk_per_share, 2)
+    actual_risk_pct = round((actual_rupee_risk / TOTAL_CAPITAL) * 100, 2)
+    pyramid_trigger = round(entry_price * 1.20, 2)
+
+    return {
+        "shares": final_shares,
+        "invested_capital": invested_capital,
+        "actual_rupee_risk": actual_rupee_risk,
+        "actual_risk_pct": actual_risk_pct,
+        "pyramid_trigger": pyramid_trigger
+    }
+
 def check_portfolio_exits(filepath=PORTFOLIO_FILE):
-    """Reads portfolio.txt and checks if any owned stock triggered a Sell or Trailing Stop."""
+    """Reads portfolio.txt and checks 30-WMA trailing exits, Stop-Loss, and +20% Pyramid triggers."""
     if not os.path.exists(filepath):
         return []
 
@@ -80,11 +112,10 @@ def check_portfolio_exits(filepath=PORTFOLIO_FILE):
             wma_10 = round(float(curr["WMA_10"]), 2)
             pnl_pct = round(((cmp_price - h["buy_price"]) / h["buy_price"]) * 100, 2)
             extension_above_30wma = ((cmp_price - wma_30) / wma_30) * 100
+            pyramid_price = round(h["buy_price"] * 1.20, 2)
 
-            # Effective trailing stop is the higher of Initial SL or 30 WMA (once in profit)
             active_stop = max(h["initial_sl"], wma_30) if cmp_price > h["buy_price"] else h["initial_sl"]
 
-            # Evaluate Exit Conditions
             if weekly_low <= h["initial_sl"] or cmp_price <= h["initial_sl"]:
                 status = "🚨 *SELL NOW (Initial Stop-Loss Hit)*"
                 action = f"Price breached your initial SL of ₹{h['initial_sl']}. Exit position."
@@ -92,11 +123,14 @@ def check_portfolio_exits(filepath=PORTFOLIO_FILE):
                 status = "🚨 *SELL NOW (Closed Below 30-WMA)*"
                 action = f"Weekly candle closed at ₹{cmp_price} below 30-WMA (₹{wma_30}). Trend broken."
             elif extension_above_30wma >= 45:
-                status = "⚠️ *BOOK PARTIAL PROFIT (Climax Run)*"
-                action = f"Stock is +{round(extension_above_30wma, 1)}% stretched above 30-WMA. Book 25-50% & trail rest at 10-WMA (₹{wma_10})."
+                status = "⚠️ *BOOK 25% PARTIAL PROFIT (Climax Run)*"
+                action = f"Stretched +{round(extension_above_30wma, 1)}% above 30-WMA. Trail rest at 10-WMA (₹{wma_10})."
+            elif pnl_pct >= 20.0:
+                status = "🔥 *MULTIBAGGER ZONE (+20% Reached)*"
+                action = f"Move GTT SL to Breakeven (₹{h['buy_price']}) or 30-WMA (₹{wma_30}). Eligible for ₹6,000 Pyramid Add-on."
             else:
                 status = "✅ *HOLD (Uptrend Intact)*"
-                action = f"Update your Broker GTT Stop-Loss to ₹{round(active_stop * 0.99, 2)} (just below 30-WMA ₹{wma_30})."
+                action = f"Keep GTT SL at ₹{round(active_stop * 0.99, 2)}. Next Pyramid Trigger: ₹{pyramid_price}."
 
             portfolio_reports.append(
                 f"💼 *{h['symbol']}* — {status}\n"
@@ -110,7 +144,7 @@ def check_portfolio_exits(filepath=PORTFOLIO_FILE):
     return portfolio_reports
 
 def scan_stock(ticker):
-    """Downloads weekly data and checks all 3 institutional breakout strategies."""
+    """Downloads weekly data, checks 3 strategies, and computes ₹1,00,000 position size."""
     try:
         df = yf.download(ticker, period="5y", interval="1wk", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
@@ -192,14 +226,17 @@ def scan_stock(ticker):
         else:
             raw_sl = min(curr["Low"], curr["WMA_200"]) * 0.98
 
-        stop_loss = round(max(float(raw_sl), float(curr["Close"]) * 0.88), 2)
-        risk_pct = round(((curr["Close"] - stop_loss) / curr["Close"]) * 100, 1)
+        entry_price = round(float(curr["Close"]), 2)
+        stop_loss = round(max(float(raw_sl), entry_price * 0.88), 2)
+        risk_pct = round(((entry_price - stop_loss) / entry_price) * 100, 1)
         clean_symbol = ticker.replace(".NS", "")
+
+        sizing = calculate_position_size(entry_price, stop_loss)
 
         return {
             "symbol": clean_symbol,
             "setup": setup_label,
-            "close": round(float(curr["Close"]), 2),
+            "close": entry_price,
             "wma_30": round(float(curr["WMA_30"]), 2),
             "wma_200": round(float(curr["WMA_200"]), 2),
             "rsi": round(float(curr["RSI_14"]), 1),
@@ -207,6 +244,11 @@ def scan_stock(ticker):
             "base_width_pct": round(float(curr["Base_Width_4W"]) * 100, 1),
             "stop_loss": stop_loss,
             "risk_pct": risk_pct,
+            "shares": sizing["shares"],
+            "invested_capital": sizing["invested_capital"],
+            "actual_rupee_risk": sizing["actual_rupee_risk"],
+            "actual_risk_pct": sizing["actual_risk_pct"],
+            "pyramid_trigger": sizing["pyramid_trigger"],
             "chart_url": f"https://in.tradingview.com/chart/?symbol=NSE:{clean_symbol}"
         }
     except Exception:
@@ -241,27 +283,30 @@ def send_notification(results, portfolio_reports):
     date_str = datetime.now().strftime("%d %b %Y")
     blocks = []
 
-    # 1. Add Portfolio Sell/Hold Alerts at the very top if portfolio.txt has stocks
     if portfolio_reports:
-        blocks.append(f"🛡️ *MY PORTFOLIO EXIT & TRAIL MONITOR ({date_str})*")
+        blocks.append(f"🛡️ *MY PORTFOLIO EXIT & PYRAMID MONITOR ({date_str})*")
         blocks.extend(portfolio_reports)
         blocks.append("──────────────────────────")
 
-    # 2. Add New Buy Breakout Alerts below
     if not results:
         blocks.append(
-            f"📊 *NSE 3-in-1 Weekly Breakout Scanner ({date_str})*\n"
-            f"No new stocks met the strict breakout + 1.5x volume criteria this week."
+            f"📊 *NSE 3-in-1 Breakout Scanner ({date_str})*\n"
+            f"Capital: ₹{int(TOTAL_CAPITAL):,} | No new stocks met the strict breakout criteria this week."
         )
     else:
         results = sorted(results, key=lambda x: x["vol_multiple"], reverse=True)
-        blocks.append(f"🚀 *NEW WEEKLY BREAKOUT ALERTS ({date_str})*\nFound *{len(results)}* stocks sorted by Volume Expansion:")
+        blocks.append(
+            f"🚀 *NEW BREAKOUT ALERTS ({date_str})*\n"
+            f"Capital: *₹{int(TOTAL_CAPITAL):,}* | Target Risk/Trade: *{RISK_PER_TRADE_PCT}% (₹{int(TOTAL_CAPITAL * RISK_PER_TRADE_PCT / 100):,})*"
+        )
         for r in results:
             blocks.append(
                 f"📌 *{r['symbol']}* — {r['setup']}\n"
-                f"   • Entry (CMP): ₹{r['close']} | Suggested SL: ₹{r['stop_loss']} (-{r['risk_pct']}%)\n"
-                f"   • 30 WMA: ₹{r['wma_30']} | 200 WMA: ₹{r['wma_200']}\n"
-                f"   • Volume: *{r['vol_multiple']}x Avg* | Weekly RSI: {r['rsi']} | 4W Base: {r['base_width_pct']}%\n"
+                f"   • Entry (CMP): ₹{r['close']} | Stop-Loss: ₹{r['stop_loss']} (-{r['risk_pct']}%)\n"
+                f"   • *Buy Qty: {r['shares']} shares (₹{r['invested_capital']:,.0f})*\n"
+                f"   • *Max Loss if SL Hits: -₹{r['actual_rupee_risk']:,.0f} (-{r['actual_risk_pct']}% of ₹1L)*\n"
+                f"   • +20% Pyramid Trigger: ₹{r['pyramid_trigger']} | 30 WMA: ₹{r['wma_30']}\n"
+                f"   • Volume: *{r['vol_multiple']}x Avg* | RSI: {r['rsi']} | 4W Base: {r['base_width_pct']}%\n"
                 f"   • [Open TradingView Chart]({r['chart_url']})"
             )
 
@@ -269,28 +314,19 @@ def send_notification(results, portfolio_reports):
     print(full_message)
     send_telegram_chunked(full_message)
 
-import sys
-
 if __name__ == "__main__":
-    # Check if a mode argument was passed from GitHub Actions
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
-
-    print(f"Running in mode: {mode}")
     portfolio_status = check_portfolio_exits(PORTFOLIO_FILE)
 
     if mode == "portfolio_only":
-        # Send ONLY portfolio check to Telegram (runs in ~5 seconds)
         if portfolio_status:
             date_str = datetime.now().strftime("%d %b %Y")
             full_message = f"🛡️ *DAILY PORTFOLIO MONITOR ({date_str})*\n\n" + "\n\n".join(portfolio_status)
             print(full_message)
             send_telegram_chunked(full_message)
-        else:
-            print("portfolio.txt is empty or missing. No daily check sent.")
     else:
-        # Full scan: Portfolio check + 500-stock Friday breakout scan
         tickers = get_nse_tickers(UNIVERSE_MODE)
-        print(f"Scanning {len(tickers)} stocks for new breakouts...")
+        print(f"Scanning {len(tickers)} stocks with ₹{int(TOTAL_CAPITAL):,} sizing...")
         breakout_stocks = []
         for t in tickers:
             res = scan_stock(t)
