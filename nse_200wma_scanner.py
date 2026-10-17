@@ -269,18 +269,34 @@ def send_notification(results, portfolio_reports):
     print(full_message)
     send_telegram_chunked(full_message)
 
+import sys
+
 if __name__ == "__main__":
-    print("Checking portfolio holdings for sell/trail signals...")
+    # Check if a mode argument was passed from GitHub Actions
+    mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+
+    print(f"Running in mode: {mode}")
     portfolio_status = check_portfolio_exits(PORTFOLIO_FILE)
 
-    tickers = get_nse_tickers(UNIVERSE_MODE)
-    print(f"Scanning {len(tickers)} stocks for new breakouts...")
-    breakout_stocks = []
-    for t in tickers:
-        res = scan_stock(t)
-        if res:
-            breakout_stocks.append(res)
+    if mode == "portfolio_only":
+        # Send ONLY portfolio check to Telegram (runs in ~5 seconds)
+        if portfolio_status:
+            date_str = datetime.now().strftime("%d %b %Y")
+            full_message = f"🛡️ *DAILY PORTFOLIO MONITOR ({date_str})*\n\n" + "\n\n".join(portfolio_status)
+            print(full_message)
+            send_telegram_chunked(full_message)
+        else:
+            print("portfolio.txt is empty or missing. No daily check sent.")
+    else:
+        # Full scan: Portfolio check + 500-stock Friday breakout scan
+        tickers = get_nse_tickers(UNIVERSE_MODE)
+        print(f"Scanning {len(tickers)} stocks for new breakouts...")
+        breakout_stocks = []
+        for t in tickers:
+            res = scan_stock(t)
+            if res:
+                breakout_stocks.append(res)
 
-    if breakout_stocks:
-        pd.DataFrame(breakout_stocks).to_csv("breakout_alerts.csv", index=False)
-    send_notification(breakout_stocks, portfolio_status)
+        if breakout_stocks:
+            pd.DataFrame(breakout_stocks).to_csv("breakout_alerts.csv", index=False)
+        send_notification(breakout_stocks, portfolio_status)
