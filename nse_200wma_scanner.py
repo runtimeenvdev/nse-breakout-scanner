@@ -15,11 +15,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "NIFTY500")
-PORTFOLIO_FILE = "portfolio.txt"
 
-TOTAL_CAPITAL = float(os.getenv("TOTAL_CAPITAL", "100000"))       # ₹1,00,000 Portfolio
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.75")) # 1.75% Risk (₹1,750)
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "22.0"))     # Max 22% (₹22,000) per stock
+PORTFOLIO_FILE = "portfolio.txt"
+HISTORY_CSV_FILE = "breakout_calls_history.csv"
+LATEST_CSV_FILE = "breakout_alerts.csv"
+
+TOTAL_CAPITAL = float(os.getenv("TOTAL_CAPITAL", "100000"))        # ₹1,00,000 Portfolio
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.75"))  # 1.75% Risk (₹1,750)
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "22.0"))      # Max 22% (₹22,000) per stock
 
 def get_nse_tickers(mode="NIFTY500"):
     """Fetches official NSE stock symbols directly from NSE India archives."""
@@ -144,7 +147,7 @@ def check_portfolio_exits(filepath=PORTFOLIO_FILE):
     return portfolio_reports
 
 def scan_stock(ticker):
-    """Downloads weekly data, checks 3 strategies, and computes ₹1,00,000 position size."""
+    """Downloads weekly data, checks 3 strategies, and builds a full 24-column record."""
     try:
         df = yf.download(ticker, period="5y", interval="1wk", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
@@ -166,6 +169,7 @@ def scan_stock(ticker):
 
         curr = df.iloc[-1]
         prev = df.iloc[-2]
+        candle_date = df.index[-1].strftime("%Y-%m-%d")
 
         if curr["Close"] < 50 or curr["Vol_Avg_20"] < 100000:
             return None
@@ -218,6 +222,7 @@ def scan_stock(ticker):
             triggered_setups.append("🔄 200-WMA Reclaim")
 
         setup_label = " + ".join(triggered_setups)
+        clean_setup_csv = setup_label.replace("🔥 ", "").replace("📈 ", "").replace("🔄 ", "")
 
         if darvas_52w_breakout:
             raw_sl = curr["Low"] * 0.98
@@ -234,25 +239,60 @@ def scan_stock(ticker):
         sizing = calculate_position_size(entry_price, stop_loss)
 
         return {
-            "symbol": clean_symbol,
-            "setup": setup_label,
-            "close": entry_price,
-            "wma_30": round(float(curr["WMA_30"]), 2),
-            "wma_200": round(float(curr["WMA_200"]), 2),
-            "rsi": round(float(curr["RSI_14"]), 1),
-            "vol_multiple": round(float(vol_ratio), 2),
-            "base_width_pct": round(float(curr["Base_Width_4W"]) * 100, 1),
-            "stop_loss": stop_loss,
-            "risk_pct": risk_pct,
-            "shares": sizing["shares"],
-            "invested_capital": sizing["invested_capital"],
-            "actual_rupee_risk": sizing["actual_rupee_risk"],
-            "actual_risk_pct": sizing["actual_risk_pct"],
-            "pyramid_trigger": sizing["pyramid_trigger"],
-            "chart_url": f"https://in.tradingview.com/chart/?symbol=NSE:{clean_symbol}"
+            "Scan_Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Candle_Week_Date": candle_date,
+            "Symbol": clean_symbol,
+            "Universe": UNIVERSE_MODE,
+            "Strategy_Triggered": clean_setup_csv,
+            "Setup_Display": setup_label,
+            "Weekly_Open": round(float(curr["Open"]), 2),
+            "Weekly_High": round(float(curr["High"]), 2),
+            "Weekly_Low": round(float(curr["Low"]), 2),
+            "Entry_Close_CMP": entry_price,
+            "WMA_30": round(float(curr["WMA_30"]), 2),
+            "WMA_200": round(float(curr["WMA_200"]), 2),
+            "Prior_20W_High": round(float(curr["High_20W"]), 2),
+            "Prior_52W_High": round(float(curr["High_52W"]), 2),
+            "Weekly_Volume": int(curr["Volume"]),
+            "Avg_Volume_20W": int(curr["Vol_Avg_20"]),
+            "Volume_Multiple": round(float(vol_ratio), 2),
+            "Weekly_RSI_14": round(float(curr["RSI_14"]), 1),
+            "Base_Width_4W_Pct": round(float(curr["Base_Width_4W"]) * 100, 1),
+            "Candle_Close_Pos_Pct": round(float(close_position) * 100, 1),
+            "Suggested_SL": stop_loss,
+            "SL_Risk_Pct": risk_pct,
+            "Rec_Shares_1L": sizing["shares"],
+            "Capital_Required_INR": sizing["invested_capital"],
+            "Max_Rupee_Risk_INR": sizing["actual_rupee_risk"],
+            "Portfolio_Risk_Pct": sizing["actual_risk_pct"],
+            "Pyramid_Trigger_20Pct": sizing["pyramid_trigger"],
+            "TradingView_URL": f"https://in.tradingview.com/chart/?symbol=NSE:{clean_symbol}"
         }
     except Exception:
         return None
+
+def update_master_csv(results):
+    """Saves this week's alerts AND appends them to breakout_calls_history.csv without duplicates."""
+    if not results:
+        return
+
+    new_df = pd.DataFrame(results).drop(columns=["Setup_Display"], errors="ignore")
+    new_df = new_df.sort_values(by="Volume_Multiple", ascending=False)
+    new_df.to_csv(LATEST_CSV_FILE, index=False)
+
+    if os.path.exists(HISTORY_CSV_FILE):
+        try:
+            existing_df = pd.read_csv(HISTORY_CSV_FILE)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            # Deduplicate by Candle_Week_Date + Symbol so re-runs update rather than duplicate rows
+            combined_df = combined_df.drop_duplicates(subset=["Candle_Week_Date", "Symbol"], keep="last")
+        except Exception:
+            combined_df = new_df
+    else:
+        combined_df = new_df
+
+    combined_df.to_csv(HISTORY_CSV_FILE, index=False)
+    print(f"Master CSV updated: {len(combined_df)} total historical calls stored in {HISTORY_CSV_FILE}.")
 
 def send_telegram_chunked(text):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -279,6 +319,18 @@ def send_telegram_chunked(text):
             "disable_web_page_preview": True
         })
 
+def send_telegram_csv(filepath, caption):
+    """Sends the CSV file directly into the Telegram chat as a downloadable spreadsheet."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) or not os.path.exists(filepath):
+        return
+    tg_doc_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    with open(filepath, "rb") as doc:
+        requests.post(
+            tg_doc_url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+            files={"document": doc}
+        )
+
 def send_notification(results, portfolio_reports):
     date_str = datetime.now().strftime("%d %b %Y")
     blocks = []
@@ -294,25 +346,32 @@ def send_notification(results, portfolio_reports):
             f"Capital: ₹{int(TOTAL_CAPITAL):,} | No new stocks met the strict breakout criteria this week."
         )
     else:
-        results = sorted(results, key=lambda x: x["vol_multiple"], reverse=True)
+        results = sorted(results, key=lambda x: x["Volume_Multiple"], reverse=True)
         blocks.append(
             f"🚀 *NEW BREAKOUT ALERTS ({date_str})*\n"
             f"Capital: *₹{int(TOTAL_CAPITAL):,}* | Target Risk/Trade: *{RISK_PER_TRADE_PCT}% (₹{int(TOTAL_CAPITAL * RISK_PER_TRADE_PCT / 100):,})*"
         )
         for r in results:
             blocks.append(
-                f"📌 *{r['symbol']}* — {r['setup']}\n"
-                f"   • Entry (CMP): ₹{r['close']} | Stop-Loss: ₹{r['stop_loss']} (-{r['risk_pct']}%)\n"
-                f"   • *Buy Qty: {r['shares']} shares (₹{r['invested_capital']:,.0f})*\n"
-                f"   • *Max Loss if SL Hits: -₹{r['actual_rupee_risk']:,.0f} (-{r['actual_risk_pct']}% of ₹1L)*\n"
-                f"   • +20% Pyramid Trigger: ₹{r['pyramid_trigger']} | 30 WMA: ₹{r['wma_30']}\n"
-                f"   • Volume: *{r['vol_multiple']}x Avg* | RSI: {r['rsi']} | 4W Base: {r['base_width_pct']}%\n"
-                f"   • [Open TradingView Chart]({r['chart_url']})"
+                f"📌 *{r['Symbol']}* — {r['Setup_Display']}\n"
+                f"   • Entry (CMP): ₹{r['Entry_Close_CMP']} | Stop-Loss: ₹{r['Suggested_SL']} (-{r['SL_Risk_Pct']}%)\n"
+                f"   • *Buy Qty: {r['Rec_Shares_1L']} shares (₹{r['Capital_Required_INR']:,.0f})*\n"
+                f"   • *Max Loss if SL Hits: -₹{r['Max_Rupee_Risk_INR']:,.0f} (-{r['Portfolio_Risk_Pct']}% of ₹1L)*\n"
+                f"   • +20% Pyramid Trigger: ₹{r['Pyramid_Trigger_20Pct']} | 30 WMA: ₹{r['WMA_30']}\n"
+                f"   • Volume: *{r['Volume_Multiple']}x Avg* | RSI: {r['Weekly_RSI_14']} | 4W Base: {r['Base_Width_4W_Pct']}%\n"
+                f"   • [Open TradingView Chart]({r['TradingView_URL']})"
             )
 
     full_message = "\n\n".join(blocks)
     print(full_message)
     send_telegram_chunked(full_message)
+
+    # Also attach the master cumulative CSV directly in Telegram
+    if os.path.exists(HISTORY_CSV_FILE):
+        send_telegram_csv(
+            HISTORY_CSV_FILE,
+            f"📁 Master Breakout Calls Log (Updated {date_str})"
+        )
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
@@ -334,5 +393,5 @@ if __name__ == "__main__":
                 breakout_stocks.append(res)
 
         if breakout_stocks:
-            pd.DataFrame(breakout_stocks).to_csv("breakout_alerts.csv", index=False)
+            update_master_csv(breakout_stocks)
         send_notification(breakout_stocks, portfolio_status)
