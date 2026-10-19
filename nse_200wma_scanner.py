@@ -14,15 +14,15 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "ALL_NSE")
+UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "NIFTY500")
 
 PORTFOLIO_FILE = "portfolio.txt"
 HISTORY_CSV_FILE = "breakout_calls_history.csv"
 LATEST_CSV_FILE = "breakout_alerts.csv"
 
 TOTAL_CAPITAL = float(os.getenv("TOTAL_CAPITAL", "100000"))        # ₹1,00,000 Portfolio
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.75"))  # 1.75% Risk (₹1,750)
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "22.0"))      # Max 22% (₹22,000) per stock
+BASE_RISK_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.75"))     # 1.75% Base Risk (₹1,750 in Bull)
+BASE_MAX_POS_PCT = float(os.getenv("MAX_POSITION_PCT", "22.0"))    # 22% Max Slot (₹22,000 in Bull)
 
 def get_nse_tickers(mode="NIFTY500"):
     """Fetches official NSE stock symbols directly from NSE India archives."""
@@ -50,10 +50,78 @@ def calculate_rsi(series, period=14):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def calculate_position_size(entry_price, stop_loss):
-    """Calculates exact share quantity, Rupee outlay, and pyramid level for ₹1,00,000 capital."""
-    max_risk_rupees = TOTAL_CAPITAL * (RISK_PER_TRADE_PCT / 100.0)
-    max_alloc_rupees = TOTAL_CAPITAL * (MAX_POSITION_PCT / 100.0)
+def get_nifty_regime():
+    """Evaluates Nifty 50 (^NSEI) trend regime (10-WMA ~ 50-DMA and 30-WMA ~ 150-DMA)."""
+    try:
+        nifty = yf.download("^NSEI", period="2y", interval="1wk", progress=False, auto_adjust=True)
+        if isinstance(nifty.columns, pd.MultiIndex):
+            nifty.columns = nifty.columns.get_level_values(0)
+
+        nifty["WMA_10"] = nifty["Close"].rolling(window=10).mean()
+        nifty["WMA_30"] = nifty["Close"].rolling(window=30).mean()
+        curr = nifty.iloc[-1]
+        prev_13w = nifty.iloc[-14] if len(nifty) >= 14 else nifty.iloc[0]
+
+        n_close = round(float(curr["Close"]), 2)
+        n_wma10 = round(float(curr["WMA_10"]), 2)
+        n_wma30 = round(float(curr["WMA_30"]), 2)
+        nifty_13w_ret = float(curr["Close"] / prev_13w["Close"])
+
+        if n_close >= n_wma10 and n_close >= n_wma30:
+            return {
+                "regime": "BULL",
+                "banner": f"🟢 *MARKET REGIME: BULLISH* (Nifty ₹{n_close} > 10-WMA ₹{n_wma10} & 30-WMA ₹{n_wma30})",
+                "risk_mult": 1.0,      # Full 1.75% risk (₹1,750)
+                "min_rs": 1.00,        # Stock must beat or match Nifty 50
+                "nifty_13w_ret": nifty_13w_ret
+            }
+        elif n_close < n_wma10 and n_close >= n_wma30:
+            return {
+                "regime": "CAUTION",
+                "banner": f"🟡 *MARKET REGIME: CHOPPY / PULLBACK* (Nifty ₹{n_close} below 10-WMA ₹{n_wma10}; Risk Halved to 0.88%)",
+                "risk_mult": 0.5,      # Half risk: 0.875% (₹875), Max slot ₹11,000
+                "min_rs": 1.05,        # Only buy leaders beating Nifty by +5%+
+                "nifty_13w_ret": nifty_13w_ret
+            }
+        else:
+            return {
+                "regime": "BEAR",
+                "banner": f"🔴 *MARKET REGIME: BEARISH* (Nifty ₹{n_close} below 30-WMA ₹{n_wma30}; Cash Protection Mode - Watchlist Only)",
+                "risk_mult": 0.0,      # 0 shares recommended; preserve ₹1,00,000 in cash/LIQUIDBEES
+                "min_rs": 1.08,
+                "nifty_13w_ret": nifty_13w_ret
+            }
+    except Exception:
+        return {
+            "regime": "BULL",
+            "banner": "🟢 *MARKET REGIME: DEFAULT* (Nifty check unavailable)",
+            "risk_mult": 1.0,
+            "min_rs": 1.00,
+            "nifty_13w_ret": 1.0
+        }
+
+def calculate_position_size(entry_price, stop_loss, regime_mult, is_only_reclaim, is_extended):
+    """Computes shares & Rupee allocation adjusted for Market Regime, Reclaim cap, and Extension."""
+    if regime_mult <= 0.0:
+        return {
+            "shares": 0,
+            "invested_capital": 0.0,
+            "actual_rupee_risk": 0.0,
+            "actual_risk_pct": 0.0,
+            "pyramid_trigger": round(entry_price * 1.20, 2)
+        }
+
+    # Cap pure 200-WMA Reclaims at 12% (₹12,000) and 1.25% risk to protect against overhead supply
+    effective_risk_pct = (1.25 if is_only_reclaim else BASE_RISK_PCT) * regime_mult
+    effective_max_pos_pct = (12.0 if is_only_reclaim else BASE_MAX_POS_PCT) * regime_mult
+
+    # If candle is extended (5% to 12% above pivot), recommend a 50% starter on Friday
+    if is_extended:
+        effective_risk_pct *= 0.5
+        effective_max_pos_pct *= 0.5
+
+    max_risk_rupees = TOTAL_CAPITAL * (effective_risk_pct / 100.0)
+    max_alloc_rupees = TOTAL_CAPITAL * (effective_max_pos_pct / 100.0)
     risk_per_share = max(entry_price - stop_loss, 0.05)
 
     raw_shares = math.floor(max_risk_rupees / risk_per_share)
@@ -146,8 +214,8 @@ def check_portfolio_exits(filepath=PORTFOLIO_FILE):
 
     return portfolio_reports
 
-def scan_stock(ticker):
-    """Downloads weekly data, checks 3 strategies, and builds a full 24-column record."""
+def scan_stock(ticker, market_info):
+    """Downloads weekly data and applies Regime, Relative Strength, Extension, and Overhead filters."""
     try:
         df = yf.download(ticker, period="5y", interval="1wk", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
@@ -169,9 +237,16 @@ def scan_stock(ticker):
 
         curr = df.iloc[-1]
         prev = df.iloc[-2]
+        prev_13w = df.iloc[-14]
         candle_date = df.index[-1].strftime("%Y-%m-%d")
 
         if curr["Close"] < 50 or curr["Vol_Avg_20"] < 100000:
+            return None
+
+        # Fix 2: Relative Strength (13-Week performance vs. Nifty 50)
+        stock_13w_ret = float(curr["Close"] / prev_13w["Close"])
+        rs_vs_nifty = round(stock_13w_ret / market_info["nifty_13w_ret"], 2)
+        if rs_vs_nifty < market_info["min_rs"]:
             return None
 
         weekly_range = curr["High"] - curr["Low"]
@@ -186,12 +261,24 @@ def scan_stock(ticker):
         if not (strong_candle and volume_breakout):
             return None
 
+        # =========================================================
+        # FIX 3: UPGRADED 200-WMA RECLAIM (WITH OVERHEAD CLEARANCE)
+        # Requires rising 30-WMA, Close > 20W High, and within 25% of 52W High
+        # =========================================================
         reclaim_200wma = (
-            prev["Close"] < prev["WMA_200"]
+            market_info["regime"] == "BULL"              # Disable bottom-fishing in choppy/bear regimes
+            and prev["Close"] < prev["WMA_200"]
             and curr["Close"] > curr["WMA_200"]
-            and curr["RSI_14"] >= 55
+            and curr["Close"] > curr["WMA_30"]
+            and curr["WMA_30"] > df["WMA_30"].iloc[-5]   # Rising 30-WMA
+            and curr["Close"] > curr["High_20W"]         # Cleared 5 months of overhead supply
+            and curr["Close"] >= (0.75 * curr["High_52W"])
+            and curr["RSI_14"] >= 58
         )
 
+        # =========================================================
+        # STRATEGY 2: Stage-2 Uptrend Breakout (20-Week High)
+        # =========================================================
         stage2_breakout = (
             curr["Close"] > curr["WMA_200"]
             and curr["Close"] > curr["WMA_30"]
@@ -201,6 +288,9 @@ def scan_stock(ticker):
             and curr["RSI_14"] >= 60
         )
 
+        # =========================================================
+        # STRATEGY 3: 52-Week High Tight Darvas Box Breakout
+        # =========================================================
         darvas_52w_breakout = (
             curr["Close"] > curr["WMA_200"]
             and curr["Close"] > curr["WMA_30"]
@@ -213,42 +303,75 @@ def scan_stock(ticker):
         if not (reclaim_200wma or stage2_breakout or darvas_52w_breakout):
             return None
 
+        # =========================================================
+        # FIX 1: PIVOT EXTENSION & LATE-CHASING FILTER
+        # =========================================================
+        if darvas_52w_breakout:
+            pivot_price = float(curr["High_52W"])
+            raw_sl = curr["Low"] * 0.98
+        elif stage2_breakout:
+            pivot_price = float(curr["High_20W"])
+            raw_sl = min(curr["Low"], curr["WMA_30"]) * 0.98
+        else:
+            pivot_price = float(max(curr["WMA_200"], curr["High_20W"]))
+            raw_sl = min(curr["Low"], curr["WMA_200"]) * 0.98
+
+        entry_price = round(float(curr["Close"]), 2)
+        weekly_gain_pct = round(((entry_price - float(prev["Close"])) / float(prev["Close"])) * 100, 1)
+        pivot_ext_pct = round(((entry_price - pivot_price) / pivot_price) * 100, 1)
+
+        # Reject severely overextended parabolic spikes (>12% above pivot or >16% weekly jump)
+        if pivot_ext_pct > 12.0 or weekly_gain_pct > 16.0:
+            return None
+
+        is_extended = (pivot_ext_pct > 5.0) or (weekly_gain_pct > 8.5)
+        pullback_buy_price = round(pivot_price + 0.40 * (entry_price - pivot_price), 2)
+
+        if market_info["regime"] == "BEAR":
+            entry_plan = f"🔴 WATCHLIST ONLY (Bear Regime — Wait for Nifty > 10-WMA)"
+        elif is_extended:
+            entry_plan = f"⏳ EXTENDED (+{pivot_ext_pct}% > Pivot) — Buy 50% Now OR Place GTT Buy @ ₹{pullback_buy_price}"
+        else:
+            entry_plan = f"✅ ACTIONABLE NOW (+{pivot_ext_pct}% Tight Breakout above ₹{round(pivot_price, 2)})"
+
         triggered_setups = []
         if darvas_52w_breakout:
             triggered_setups.append("🔥 52W-High Darvas Box")
         if stage2_breakout:
             triggered_setups.append("📈 Stage-2 (20W High)")
         if reclaim_200wma:
-            triggered_setups.append("🔄 200-WMA Reclaim")
+            triggered_setups.append("🔄 200-WMA + 20W-High Turnaround")
 
         setup_label = " + ".join(triggered_setups)
         clean_setup_csv = setup_label.replace("🔥 ", "").replace("📈 ", "").replace("🔄 ", "")
+        is_only_reclaim = reclaim_200wma and not (darvas_52w_breakout or stage2_breakout)
 
-        if darvas_52w_breakout:
-            raw_sl = curr["Low"] * 0.98
-        elif stage2_breakout:
-            raw_sl = min(curr["Low"], curr["WMA_30"]) * 0.98
-        else:
-            raw_sl = min(curr["Low"], curr["WMA_200"]) * 0.98
-
-        entry_price = round(float(curr["Close"]), 2)
         stop_loss = round(max(float(raw_sl), entry_price * 0.88), 2)
         risk_pct = round(((entry_price - stop_loss) / entry_price) * 100, 1)
         clean_symbol = ticker.replace(".NS", "")
 
-        sizing = calculate_position_size(entry_price, stop_loss)
+        sizing = calculate_position_size(
+            entry_price, stop_loss, market_info["risk_mult"], is_only_reclaim, is_extended
+        )
 
         return {
             "Scan_Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "Candle_Week_Date": candle_date,
+            "Market_Regime": market_info["regime"],
             "Symbol": clean_symbol,
             "Universe": UNIVERSE_MODE,
             "Strategy_Triggered": clean_setup_csv,
             "Setup_Display": setup_label,
+            "Entry_Plan": entry_plan,
             "Weekly_Open": round(float(curr["Open"]), 2),
             "Weekly_High": round(float(curr["High"]), 2),
             "Weekly_Low": round(float(curr["Low"]), 2),
             "Entry_Close_CMP": entry_price,
+            "Breakout_Pivot": round(pivot_price, 2),
+            "Pivot_Extension_Pct": pivot_ext_pct,
+            "Weekly_Gain_Pct": weekly_gain_pct,
+            "Pullback_GTT_Buy": pullback_buy_price,
+            "RS_vs_Nifty_13W": rs_vs_nifty,
             "WMA_30": round(float(curr["WMA_30"]), 2),
             "WMA_200": round(float(curr["WMA_200"]), 2),
             "Prior_20W_High": round(float(curr["High_20W"]), 2),
@@ -276,15 +399,14 @@ def update_master_csv(results):
     if not results:
         return
 
-    new_df = pd.DataFrame(results).drop(columns=["Setup_Display"], errors="ignore")
-    new_df = new_df.sort_values(by="Volume_Multiple", ascending=False)
+    new_df = pd.DataFrame(results).drop(columns=["Setup_Display", "Entry_Plan"], errors="ignore")
+    new_df = new_df.sort_values(by=["Pivot_Extension_Pct", "Volume_Multiple"], ascending=[True, False])
     new_df.to_csv(LATEST_CSV_FILE, index=False)
 
     if os.path.exists(HISTORY_CSV_FILE):
         try:
             existing_df = pd.read_csv(HISTORY_CSV_FILE)
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-            # Deduplicate by Candle_Week_Date + Symbol so re-runs update rather than duplicate rows
             combined_df = combined_df.drop_duplicates(subset=["Candle_Week_Date", "Symbol"], keep="last")
         except Exception:
             combined_df = new_df
@@ -320,7 +442,6 @@ def send_telegram_chunked(text):
         })
 
 def send_telegram_csv(filepath, caption):
-    """Sends the CSV file directly into the Telegram chat as a downloadable spreadsheet."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) or not os.path.exists(filepath):
         return
     tg_doc_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
@@ -331,9 +452,9 @@ def send_telegram_csv(filepath, caption):
             files={"document": doc}
         )
 
-def send_notification(results, portfolio_reports):
+def send_notification(results, portfolio_reports, market_info):
     date_str = datetime.now().strftime("%d %b %Y")
-    blocks = []
+    blocks = [market_info["banner"]]
 
     if portfolio_reports:
         blocks.append(f"🛡️ *MY PORTFOLIO EXIT & PYRAMID MONITOR ({date_str})*")
@@ -342,23 +463,23 @@ def send_notification(results, portfolio_reports):
 
     if not results:
         blocks.append(
-            f"📊 *NSE 3-in-1 Breakout Scanner ({date_str})*\n"
-            f"Capital: ₹{int(TOTAL_CAPITAL):,} | No new stocks met the strict breakout criteria this week."
+            f"📊 *NSE Regime-Filtered Breakout Scanner ({date_str})*\n"
+            f"Capital: ₹{int(TOTAL_CAPITAL):,} | No stocks passed the Pivot Extension, RS >= {market_info['min_rs']}, and Volume filters this week."
         )
     else:
-        results = sorted(results, key=lambda x: x["Volume_Multiple"], reverse=True)
+        # Prioritize tight, actionable breakouts first, then sort by highest Volume Multiple
+        results = sorted(results, key=lambda x: (x["Pivot_Extension_Pct"] > 5.0, -x["Volume_Multiple"]))
         blocks.append(
             f"🚀 *NEW BREAKOUT ALERTS ({date_str})*\n"
-            f"Capital: *₹{int(TOTAL_CAPITAL):,}* | Target Risk/Trade: *{RISK_PER_TRADE_PCT}% (₹{int(TOTAL_CAPITAL * RISK_PER_TRADE_PCT / 100):,})*"
+            f"Capital: *₹{int(TOTAL_CAPITAL):,}* | Active Regime Risk Multiplier: *{market_info['risk_mult']}x*"
         )
         for r in results:
             blocks.append(
                 f"📌 *{r['Symbol']}* — {r['Setup_Display']}\n"
-                f"   • Entry (CMP): ₹{r['Entry_Close_CMP']} | Stop-Loss: ₹{r['Suggested_SL']} (-{r['SL_Risk_Pct']}%)\n"
-                f"   • *Buy Qty: {r['Rec_Shares_1L']} shares (₹{r['Capital_Required_INR']:,.0f})*\n"
-                f"   • *Max Loss if SL Hits: -₹{r['Max_Rupee_Risk_INR']:,.0f} (-{r['Portfolio_Risk_Pct']}% of ₹1L)*\n"
-                f"   • +20% Pyramid Trigger: ₹{r['Pyramid_Trigger_20Pct']} | 30 WMA: ₹{r['WMA_30']}\n"
-                f"   • Volume: *{r['Volume_Multiple']}x Avg* | RSI: {r['Weekly_RSI_14']} | 4W Base: {r['Base_Width_4W_Pct']}%\n"
+                f"   • {r['Entry_Plan']}\n"
+                f"   • CMP: ₹{r['Entry_Close_CMP']} (+{r['Weekly_Gain_Pct']}% wk) | Pivot: ₹{r['Breakout_Pivot']} | SL: ₹{r['Suggested_SL']} (-{r['SL_Risk_Pct']}%)\n"
+                f"   • *Friday Buy Qty: {r['Rec_Shares_1L']} shares (₹{r['Capital_Required_INR']:,.0f})* | Risk: -₹{r['Max_Rupee_Risk_INR']:,.0f} (-{r['Portfolio_Risk_Pct']}%)\n"
+                f"   • RS vs Nifty (13W): *{r['RS_vs_Nifty_13W']}x* | Vol: *{r['Volume_Multiple']}x* | 4W Base: {r['Base_Width_4W_Pct']}%\n"
                 f"   • [Open TradingView Chart]({r['TradingView_URL']})"
             )
 
@@ -366,32 +487,32 @@ def send_notification(results, portfolio_reports):
     print(full_message)
     send_telegram_chunked(full_message)
 
-    # Also attach the master cumulative CSV directly in Telegram
     if os.path.exists(HISTORY_CSV_FILE):
         send_telegram_csv(
             HISTORY_CSV_FILE,
-            f"📁 Master Breakout Calls Log (Updated {date_str})"
+            f"📁 Master Breakout Calls Log (Updated {date_str} | Regime: {market_info['regime']})"
         )
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+    market_info = get_nifty_regime()
     portfolio_status = check_portfolio_exits(PORTFOLIO_FILE)
 
     if mode == "portfolio_only":
         if portfolio_status:
             date_str = datetime.now().strftime("%d %b %Y")
-            full_message = f"🛡️ *DAILY PORTFOLIO MONITOR ({date_str})*\n\n" + "\n\n".join(portfolio_status)
+            full_message = f"{market_info['banner']}\n\n🛡️ *DAILY PORTFOLIO MONITOR ({date_str})*\n\n" + "\n\n".join(portfolio_status)
             print(full_message)
             send_telegram_chunked(full_message)
     else:
         tickers = get_nse_tickers(UNIVERSE_MODE)
-        print(f"Scanning {len(tickers)} stocks with ₹{int(TOTAL_CAPITAL):,} sizing...")
+        print(f"Regime: {market_info['regime']} | Scanning {len(tickers)} stocks...")
         breakout_stocks = []
         for t in tickers:
-            res = scan_stock(t)
+            res = scan_stock(t, market_info)
             if res:
                 breakout_stocks.append(res)
 
         if breakout_stocks:
             update_master_csv(breakout_stocks)
-        send_notification(breakout_stocks, portfolio_status)
+        send_notification(breakout_stocks, portfolio_status, market_info)
