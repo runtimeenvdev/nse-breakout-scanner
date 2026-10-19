@@ -2,8 +2,7 @@ name: NSE 3-in-1 Weekly Breakout Scanner
 
 on:
   schedule:
-    # 3:05 PM IST every Friday = 09:35 UTC (15:05 - 05:30)
-    # Day-of-Week 5 = Friday
+    # 3:05 PM IST every Friday = 09:35 UTC
     - cron: '35 9 * * 5'
 
   workflow_dispatch:
@@ -16,6 +15,9 @@ on:
         options:
           - NIFTY500
           - ALL_NSE
+
+permissions:
+  contents: write
 
 jobs:
   run-breakout-scan:
@@ -40,4 +42,28 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           UNIVERSE_MODE: ${{ github.event.inputs.universe_mode || 'NIFTY500' }}
+          TOTAL_CAPITAL: '100000'
+          RISK_PER_TRADE_PCT: '1.75'
+          MAX_POSITION_PCT: '22.0'
         run: python nse_200wma_scanner.py full
+
+      - name: Save & Commit Master CSV History to Repository
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f breakout_calls_history.csv ]; then
+            git add breakout_calls_history.csv
+            git diff --staged --quiet || git commit -m "Auto-update breakout_calls_history.csv [skip ci]"
+            git push
+          fi
+
+      - name: Upload Breakout Watchlist CSV Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nse-breakout-alerts-${{ github.run_number }}
+          path: |
+            breakout_alerts.csv
+            breakout_calls_history.csv
+          if-no-files-found: ignore
+          retention-days: 90
