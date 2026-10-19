@@ -14,7 +14,7 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "NIFTY500")
+UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "ALL_NSE")
 
 PORTFOLIO_FILE = "portfolio.txt"
 HISTORY_CSV_FILE = "breakout_calls_history.csv"
